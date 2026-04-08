@@ -1501,6 +1501,8 @@ document.getElementById('loop-export').addEventListener('click', async e => {
       '-ss', ss,
       '-i', inName,
       '-t', dur,
+      '-map', '0:v:0',
+      '-map', '0:a:0?',
       '-c', 'copy',
       '-avoid_negative_ts', 'make_zero',
       '-movflags', '+faststart',
