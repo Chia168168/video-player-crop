@@ -1471,14 +1471,14 @@ document.getElementById('loop-export').addEventListener('click', async e => {
   }
   if (!currentFile) { showToast('沒有影片檔案'); return; }
 
-  // Warn if file too large for WASM memory
   const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent);
   const sizeMB = currentFile.size / 1024 / 1024;
   const limitMB = isIOS ? 200 : 800;
-  if (sizeMB > limitMB) {
-    showToast(`檔案 ${sizeMB.toFixed(0)}MB 太大\n${isIOS ? 'iOS 建議先轉 MP4 再用電腦剪輯' : '建議 800MB 以下'}`);
+  if (sizeMB > limitMB && !window._resumeSkipSizeCheck) {
+    showToast(`檔案 ${sizeMB.toFixed(0)}MB 太大。${isIOS ? 'iOS 建議先轉 MP4 再用電腦剪輯' : '建議 800MB 以下'}`);
     return;
   }
+  window._resumeSkipSizeCheck = false;
 
   exportCancelled = false;
   exportOverlay.classList.add('show');
@@ -1794,6 +1794,7 @@ window.addEventListener('load', () => {
         video.addEventListener('canplay', async function once() {
           video.removeEventListener('canplay', once);
           await new Promise(r => setTimeout(r, 800));
+          window._resumeSkipSizeCheck = true;
           document.getElementById('loop-export').click();
         }, { once: true });
       });
