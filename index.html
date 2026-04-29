@@ -1128,128 +1128,314 @@ function readFileSlice(file, start, end) {
 }
 
 // ── Byte-range extraction: only read the bytes needed for the clip ──
-async function extractClipBlob(file, loopIn, loopOut) {
+async function extractClipBlob(file, clipIn, clipOut) {
   const CHUNK = 8 * 1024 * 1024;
 
-  // Find moov and ftyp in head
+  // 1. Find ftyp + moov in head (or tail)
   const headBuf = await readFileSlice(file, 0, Math.min(CHUNK, file.size));
-  const headView = new DataView(headBuf);
-  let ftypStart = -1, ftypLen = 0;
-  let moovBuf = null;
+  let ftypBytes = null, moovBytes = null;
 
-  let off = 0;
-  while (off + 8 <= headBuf.byteLength) {
-    const sz = readU32(headView, off);
-    const nm = read4cc(headView, off + 4);
-    if (sz < 8) break;
-    if (nm === 'ftyp') { ftypStart = off; ftypLen = sz; }
-    if (nm === 'moov') { moovBuf = headBuf.slice(off, Math.min(off + sz, headBuf.byteLength)); break; }
-    off += sz;
+  function scanForBoxes(buf) {
+    const v = new DataView(buf);
+    let off = 0;
+    while (off + 8 <= buf.byteLength) {
+      const sz = readU32(v, off);
+      const nm = read4cc(v, off + 4);
+      if (sz < 8) break;
+      if (nm === 'ftyp') ftypBytes = buf.slice(off, off + sz);
+      if (nm === 'moov') moovBytes = buf.slice(off, Math.min(off + sz, buf.byteLength));
+      off += sz;
+    }
   }
+  scanForBoxes(headBuf);
 
-  // Try tail if moov not in head
-  if (!moovBuf && file.size > CHUNK) {
-    const tailStart = file.size - CHUNK;
-    const tailBuf = await readFileSlice(file, tailStart, file.size);
+  if (!moovBytes && file.size > CHUNK) {
+    const tailBuf = await readFileSlice(file, file.size - CHUNK, file.size);
     const tv = new DataView(tailBuf);
     for (let i = 4; i + 8 <= tailBuf.byteLength; i++) {
       if (read4cc(tv, i) === 'moov') {
         const sz = readU32(tv, i - 4);
-        moovBuf = tailBuf.slice(i - 4, Math.min(i - 4 + sz, tailBuf.byteLength));
+        moovBytes = tailBuf.slice(i - 4, Math.min(i - 4 + sz, tailBuf.byteLength));
         break;
       }
     }
   }
+  if (!moovBytes) throw new Error('找不到 moov box');
 
-  if (!moovBuf) throw new Error('moov not found');
-
-  // Parse video track tables
-  const track = parseVideoTrackFull(moovBuf);
-  if (!track || !track.stco.length) throw new Error('no video track or stco');
+  // 2. Parse full video track tables
+  const track = parseVideoTrackFull(moovBytes);
+  if (!track || !track.stco.length) throw new Error('找不到視訊軌');
 
   const { timescale, stts, stsc, stco, stsz, fixedSampleSize } = track;
-  const totalChunks = stco.length;
 
-  // Convert time → sample index
-  function timeToSample(sec) {
+  // 3. Build cumulative sample→time table
+  function timeToSampleIdx(sec) {
     const target = Math.round(sec * timescale);
     let sample = 0, t = 0;
-    for (const { count, delta } of stts) {
-      if (delta === 0) { sample += count; continue; }
-      const entryEndTime = t + count * delta;
-      if (entryEndTime > target) return sample + Math.floor((target - t) / delta);
-      t = entryEndTime; sample += count;
+    for (const e of stts) {
+      if (!e.delta) { sample += e.count; continue; }
+      const end = t + e.count * e.delta;
+      if (end > target) return sample + Math.max(0, Math.floor((target - t) / e.delta));
+      t = end; sample += e.count;
     }
     return sample;
   }
 
-  // Expand stsc → samples per chunk array
-  function samplesInChunk(chunkIdx) {
-    let result = 1;
+  // 4. Expand stsc: chunk→samplesPerChunk
+  function samplesInChunk(ci) {
+    let r = 1;
     for (let i = stsc.length - 1; i >= 0; i--) {
-      if (chunkIdx >= stsc[i].firstChunk - 1) { result = stsc[i].samplesPerChunk; break; }
+      if (ci >= stsc[i].firstChunk - 1) { r = stsc[i].samplesPerChunk; break; }
     }
-    return result;
+    return r;
   }
 
-  // Sample → chunk index
-  function sampleToChunk(sampleIdx) {
-    let s = 0;
-    for (let c = 0; c < totalChunks; c++) {
-      const n = samplesInChunk(c);
-      if (s + n > sampleIdx) return c;
-      s += n;
-    }
-    return totalChunks - 1;
+  // 5. Build chunk start sample index array
+  const totalChunks = stco.length;
+  const chunkStartSample = new Array(totalChunks);
+  let s = 0;
+  for (let c = 0; c < totalChunks; c++) { chunkStartSample[c] = s; s += samplesInChunk(c); }
+  const totalSamples = s;
+
+  // 6. Sample size helper
+  function sampleSize(si) {
+    if (fixedSampleSize > 0) return fixedSampleSize;
+    return si < stsz.length ? stsz[si] : 0;
   }
 
-  // Size of a chunk in bytes
-  function chunkByteSize(chunkIdx) {
-    if (fixedSampleSize > 0) return fixedSampleSize * samplesInChunk(chunkIdx);
-    let s = 0, cumSamples = 0;
-    for (let c = 0; c < chunkIdx; c++) cumSamples += samplesInChunk(c);
-    const n = samplesInChunk(chunkIdx);
-    for (let i = 0; i < n; i++) cumSamples + i < stsz.length ? s += stsz[cumSamples + i] : 0;
-    return s;
+  // 7. Map clip time → chunk range
+  const startSample = timeToSampleIdx(clipIn);
+  const endSample   = Math.min(totalSamples, timeToSampleIdx(clipOut));
+
+  let startChunk = 0;
+  for (let c = 0; c < totalChunks - 1; c++) {
+    if (chunkStartSample[c + 1] > startSample) { startChunk = c; break; }
+    startChunk = c;
+  }
+  let endChunk = startChunk;
+  for (let c = startChunk; c < totalChunks; c++) {
+    endChunk = c;
+    if (chunkStartSample[c] + samplesInChunk(c) >= endSample) break;
   }
 
-  const startChunk = Math.max(0, sampleToChunk(timeToSample(loopIn)));
-  const endChunk   = Math.min(totalChunks - 1, sampleToChunk(timeToSample(loopOut)));
-
+  // 8. Read only those bytes
   const startByte = stco[startChunk];
   let endByte;
   if (endChunk + 1 < totalChunks) {
     endByte = stco[endChunk + 1];
   } else {
-    endByte = stco[endChunk] + chunkByteSize(endChunk);
+    // Last chunk: sum sample sizes
+    let nb = stco[endChunk];
+    const n = samplesInChunk(endChunk);
+    for (let i = 0; i < n; i++) nb += sampleSize(chunkStartSample[endChunk] + i);
+    endByte = nb;
   }
   endByte = Math.min(endByte, file.size);
 
-  // Read only the clip bytes
-  const clipBuf = await readFileSlice(file, startByte, endByte);
-  const clipSize = endByte - startByte;
+  const mdatPayload = await readFileSlice(file, startByte, endByte);
+  const clipChunks  = endChunk - startChunk + 1;
 
-  // Patch moov: adjust stco offsets so they point into the new file
-  // New layout: [ftyp][moov][mdat_header(8)][clip_bytes]
-  const ftypSize = ftypLen;
-  const moovSize = moovBuf.byteLength;
-  const newMoovBuf = patchStcoInMoov(moovBuf, startByte, ftypSize + moovSize + 8);
+  // 9. Build trimmed stts for clip sample range
+  const clipStts = [];
+  {
+    let si = 0, t = 0;
+    for (const e of stts) {
+      const entryEnd = si + e.count;
+      const oStart = Math.max(si, startSample);
+      const oEnd   = Math.min(entryEnd, endSample);
+      if (oEnd > oStart) clipStts.push({ count: oEnd - oStart, delta: e.delta });
+      si = entryEnd;
+      if (si >= endSample) break;
+    }
+  }
 
-  // mdat header
+  // 10. Build trimmed stsc (chunk indices relative to 0)
+  const clipStsc = [{ firstChunk: 1, samplesPerChunk: samplesInChunk(startChunk) }];
+  for (let c = startChunk + 1; c <= endChunk; c++) {
+    const n = samplesInChunk(c);
+    if (n !== clipStsc[clipStsc.length - 1].samplesPerChunk) {
+      clipStsc.push({ firstChunk: c - startChunk + 1, samplesPerChunk: n });
+    }
+  }
+
+  // 11. Build trimmed stsz
+  const clipStsz = [];
+  if (!fixedSampleSize) {
+    for (let si = startSample; si < endSample; si++) {
+      clipStsz.push(sampleSize(si));
+    }
+  }
+
+  // 12. New layout: [ftyp?][moov_trimmed][mdat]
+  // Compute sizes first to get correct stco offsets
+  const ftypSize  = ftypBytes ? ftypBytes.byteLength : 0;
+  const moovSize  = estimateTrimmedMoovSize(moovBytes, clipChunks, clipStts, clipStsc, clipStsz, fixedSampleSize);
+  const mdatStart = ftypSize + moovSize;
+  const mdatHeaderSize = 8;
+
+  // New stco: chunk i starts at mdatStart + 8 + (offset_within_mdat)
+  const clipStco = [];
+  for (let c = startChunk; c <= endChunk; c++) {
+    clipStco.push(mdatStart + mdatHeaderSize + (stco[c] - startByte));
+  }
+
+  // 13. Build new moov box with trimmed tables
+  const newMoov = buildTrimmedMoov(moovBytes, clipStts, clipStsc, clipStco, clipStsz, fixedSampleSize, clipIn, clipOut, timescale);
+
+  // 14. mdat header
   const mdatHdr = new ArrayBuffer(8);
-  const mdatView = new DataView(mdatHdr);
-  mdatView.setUint32(0, clipSize + 8, false);
-  mdatView.setUint8(4, 0x6D); mdatView.setUint8(5, 0x64);
-  mdatView.setUint8(6, 0x61); mdatView.setUint8(7, 0x74);
+  const mdv = new DataView(mdatHdr);
+  mdv.setUint32(0, mdatPayload.byteLength + 8, false);
+  mdv.setUint8(4, 0x6D); mdv.setUint8(5, 0x64); mdv.setUint8(6, 0x61); mdv.setUint8(7, 0x74);
 
   const parts = [];
-  if (ftypStart >= 0) parts.push(headBuf.slice(ftypStart, ftypStart + ftypLen));
-  parts.push(newMoovBuf);
+  if (ftypBytes) parts.push(ftypBytes);
+  parts.push(newMoov);
   parts.push(mdatHdr);
-  parts.push(clipBuf);
+  parts.push(mdatPayload);
 
   const mime = file.type || (file.name.toLowerCase().endsWith('.mov') ? 'video/quicktime' : 'video/mp4');
   return new Blob(parts, { type: mime });
+}
+
+// Estimate trimmed moov size (walk and replace table boxes)
+function estimateTrimmedMoovSize(moovBytes, clipChunks, clipStts, clipStsc, clipStsz, fixedSampleSize) {
+  // Build the moov and measure it
+  return buildTrimmedMoov(moovBytes, clipStts, clipStsc, new Array(clipChunks).fill(0), clipStsz, fixedSampleSize, 0, 1, 1).byteLength;
+}
+
+function buildTrimmedMoov(moovBytes, clipStts, clipStsc, clipStco, clipStsz, fixedSampleSize, clipIn, clipOut, timescale) {
+  const src = new DataView(moovBytes);
+  const clipDurTicks = Math.round((clipOut - clipIn) * timescale);
+
+  function buildBox(name, payload) {
+    const n = new ArrayBuffer(8 + payload.byteLength);
+    const v = new DataView(n);
+    v.setUint32(0, 8 + payload.byteLength, false);
+    for (let i = 0; i < 4; i++) v.setUint8(4 + i, name.charCodeAt(i));
+    new Uint8Array(n, 8).set(new Uint8Array(payload));
+    return n;
+  }
+
+  function buildStts() {
+    const b = new ArrayBuffer(8 + clipStts.length * 8);
+    const v = new DataView(b);
+    v.setUint32(4, clipStts.length, false); // entry count
+    clipStts.forEach((e, i) => {
+      v.setUint32(8 + i * 8,     e.count, false);
+      v.setUint32(8 + i * 8 + 4, e.delta, false);
+    });
+    return b;
+  }
+
+  function buildStsc() {
+    const b = new ArrayBuffer(8 + clipStsc.length * 12);
+    const v = new DataView(b);
+    v.setUint32(4, clipStsc.length, false);
+    clipStsc.forEach((e, i) => {
+      v.setUint32(8 + i * 12,     e.firstChunk,     false);
+      v.setUint32(8 + i * 12 + 4, e.samplesPerChunk, false);
+      v.setUint32(8 + i * 12 + 8, 1,                false); // sample description index
+    });
+    return b;
+  }
+
+  function buildStco() {
+    const b = new ArrayBuffer(8 + clipStco.length * 4);
+    const v = new DataView(b);
+    v.setUint32(4, clipStco.length, false);
+    clipStco.forEach((o, i) => v.setUint32(8 + i * 4, o, false));
+    return b;
+  }
+
+  function buildStsz() {
+    if (fixedSampleSize > 0) {
+      const b = new ArrayBuffer(12);
+      const v = new DataView(b);
+      v.setUint32(4, fixedSampleSize, false);
+      v.setUint32(8, clipStsz.length || 0, false);
+      return b;
+    }
+    const b = new ArrayBuffer(12 + clipStsz.length * 4);
+    const v = new DataView(b);
+    v.setUint32(4, 0, false); // sample size = 0 means variable
+    v.setUint32(8, clipStsz.length, false);
+    clipStsz.forEach((s, i) => v.setUint32(12 + i * 4, s, false));
+    return b;
+  }
+
+  // Walk moov and rebuild, replacing table boxes
+  function walkAndRebuild(buf, s, e, depth) {
+    const parts = [];
+    let off = s;
+    while (off + 8 <= e) {
+      const sz = readU32(new DataView(buf), off);
+      const nm = read4cc(new DataView(buf), off + 4);
+      if (sz < 8) break;
+      const cs = off + 8, ce = Math.min(off + sz, e);
+
+      if (['moov','trak','mdia','minf','stbl'].includes(nm)) {
+        const inner = walkAndRebuild(buf, cs, ce, depth + 1);
+        const hdr = new ArrayBuffer(8);
+        const hv = new DataView(hdr);
+        hv.setUint32(0, 8 + inner.byteLength, false);
+        for (let i = 0; i < 4; i++) hv.setUint8(4 + i, nm.charCodeAt(i));
+        parts.push(hdr, inner);
+      } else if (nm === 'stts') {
+        const p = buildStts();
+        parts.push(buildBox('stts', p));
+      } else if (nm === 'stsc') {
+        const p = buildStsc();
+        parts.push(buildBox('stsc', p));
+      } else if (nm === 'stco' || nm === 'co64') {
+        const p = buildStco();
+        parts.push(buildBox('stco', p));
+      } else if (nm === 'stsz') {
+        const p = buildStsz();
+        parts.push(buildBox('stsz', p));
+      } else if (nm === 'mdhd') {
+        // Patch duration in mdhd
+        const orig = buf.slice(cs, ce);
+        const v = new DataView(orig);
+        const ver = v.getUint8(0);
+        if (ver === 1) v.setBigUint64(20, BigInt(clipDurTicks), false);
+        else v.setUint32(16, clipDurTicks, false);
+        parts.push(buildBox('mdhd', orig));
+      } else if (nm === 'tkhd') {
+        const orig = buf.slice(cs, ce);
+        const v = new DataView(orig);
+        const ver = v.getUint8(0);
+        const durTicks90k = Math.round((clipOut - clipIn) * 1000); // tkhd uses movie timescale (usually ms/90k)
+        if (ver === 1) v.setBigUint64(28, BigInt(durTicks90k), false);
+        else v.setUint32(20, durTicks90k, false);
+        parts.push(buildBox('tkhd', orig));
+      } else if (nm === 'mvhd') {
+        const orig = buf.slice(cs, ce);
+        const v = new DataView(orig);
+        const ver = v.getUint8(0);
+        const mvTs = ver === 1 ? readU32(new DataView(orig), 20) : readU32(new DataView(orig), 12);
+        const mvDur = Math.round((clipOut - clipIn) * mvTs);
+        if (ver === 1) v.setUint32(28, mvDur, false);
+        else v.setUint32(16, mvDur, false);
+        parts.push(buildBox('mvhd', orig));
+      } else if (nm === 'elst' || nm === 'edts') {
+        // Skip edit lists — they can cause offset issues
+      } else {
+        parts.push(buf.slice(off, ce));
+      }
+      off += sz;
+    }
+
+    // Combine parts
+    const total = parts.reduce((a, p) => a + p.byteLength, 0);
+    const out = new ArrayBuffer(total);
+    const u8 = new Uint8Array(out);
+    let pos = 0;
+    for (const p of parts) { u8.set(new Uint8Array(p), pos); pos += p.byteLength; }
+    return out;
+  }
+
+  return walkAndRebuild(moovBytes, 0, moovBytes.byteLength, 0);
 }
 
 function parseVideoTrackFull(moovBuf) {
@@ -1316,46 +1502,6 @@ function parseTrakFull(view, start, end) {
   walk(start, end);
   if (!isVideo || !timescale) return null;
   return { timescale, stts, stsc, stco, stsz, fixedSampleSize, isVideo };
-}
-
-function patchStcoInMoov(moovBuf, originalStartByte, newMdatStart) {
-  const buf = moovBuf.slice(0);
-  const view = new DataView(buf);
-  const adjustment = newMdatStart - originalStartByte;
-
-  function walk(s, e) {
-    let off = s;
-    while (off + 8 <= e) {
-      const sz = readU32(view, off);
-      const nm = read4cc(view, off + 4);
-      if (sz < 8) break;
-      const ce = Math.min(off + sz, e);
-      if (['trak','mdia','minf','stbl'].includes(nm)) { walk(off + 8, ce); }
-      else if (nm === 'stco') {
-        const cnt = readU32(view, off + 12);
-        for (let i = 0; i < cnt; i++) {
-          const p = off + 16 + i * 4;
-          if (p + 4 > buf.byteLength) break;
-          const oldVal = readU32(view, p);
-          view.setUint32(p, Math.max(0, oldVal + adjustment), false);
-        }
-      }
-      else if (nm === 'co64') {
-        const cnt = readU32(view, off + 12);
-        for (let i = 0; i < cnt; i++) {
-          const p = off + 16 + i * 8;
-          if (p + 8 > buf.byteLength) break;
-          const hi = readU32(view, p), lo = readU32(view, p + 4);
-          const newVal = hi * 0x100000000 + lo + adjustment;
-          view.setUint32(p,     Math.floor(newVal / 0x100000000) >>> 0, false);
-          view.setUint32(p + 4, newVal >>> 0, false);
-        }
-      }
-      off += sz;
-    }
-  }
-  walk(8, buf.byteLength);
-  return buf;
 }
 
 function seekExact(t) {
