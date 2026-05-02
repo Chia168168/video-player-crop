@@ -1129,9 +1129,10 @@ function snapToCommonFPS(raw) {
 
 function readFileSlice(file, start, end) {
   return new Promise((resolve, reject) => {
+    if (start >= end) { resolve(new ArrayBuffer(0)); return; }
     const r = new FileReader();
     r.onload = e => resolve(e.target.result);
-    r.onerror = reject;
+    r.onerror = e => reject(new Error('FileReader 錯誤：' + (r.error?.message || '讀取失敗')));
     r.readAsArrayBuffer(file.slice(start, end));
   });
 }
@@ -1183,8 +1184,8 @@ async function extractClipBlob(file, clipIn, clipOut) {
   }
   await scanBuf(await readFileSlice(file, 0, SCAN));
   if (!moovU8 && file.size > SCAN) {
-    const tail = await readFileSlice(file, file.size - SCAN, file.size);
-    const tb = new Uint8Array(tail);
+    const tailAb = await readFileSlice(file, file.size - SCAN, file.size);
+    const tb = new Uint8Array(tailAb);
     for (let i = 4; i+8 <= tb.length; i++) {
       if (cc(tb,i) === 'moov') { moovU8 = tb.slice(i-4, Math.min(i-4+u32(tb,i-4), tb.length)); break; }
     }
@@ -1284,13 +1285,13 @@ async function extractClipBlob(file, clipIn, clipOut) {
     return b;
   }
 
-  function walkStbl(b, s, e) {
+  function walkStbl(b, s, e, stcoOffsets) {
     const parts=[]; let off=s;
     while(off+8<=e){const sz=u32(b,off),nm=cc(b,off+4);if(sz<8)break;
       const ce=Math.min(off+sz,e);
       if(nm==='stts') parts.push(mkStts());
       else if(nm==='stsc') parts.push(mkStsc());
-      else if(nm==='stco'||nm==='co64') ; // skip, add later
+      else if(nm==='stco'||nm==='co64') parts.push(mkStco(stcoOffsets)); // replace with correct offsets
       else if(nm==='stsz') parts.push(mkStsz());
       else if(nm==='stss'||nm==='ctts') {} // skip
       else parts.push(b.slice(off,ce));
@@ -1298,33 +1299,33 @@ async function extractClipBlob(file, clipIn, clipOut) {
     return parts;
   }
 
-  function walkMinf(b, s, e) {
+  function walkMinf(b, s, e, stcoOffsets) {
     const parts=[]; let off=s;
     while(off+8<=e){const sz=u32(b,off),nm=cc(b,off+4);if(sz<8)break;
       const ce=Math.min(off+sz,e);
-      if(nm==='stbl') { const sp=walkStbl(b,off+8,ce); parts.push(box('stbl',...sp)); }
+      if(nm==='stbl') { const sp=walkStbl(b,off+8,ce,stcoOffsets); parts.push(box('stbl',...sp)); }
       else parts.push(b.slice(off,ce));
       off+=sz;}
     return parts;
   }
 
-  function walkMdia(b, s, e) {
+  function walkMdia(b, s, e, stcoOffsets) {
     const parts=[]; let off=s;
     while(off+8<=e){const sz=u32(b,off),nm=cc(b,off+4);if(sz<8)break;
       const ce=Math.min(off+sz,e);
       if(nm==='mdhd') parts.push(box('mdhd',patchDur(b.slice(off+8,ce), clipTicks)));
-      else if(nm==='minf') parts.push(box('minf',...walkMinf(b,off+8,ce)));
+      else if(nm==='minf') parts.push(box('minf',...walkMinf(b,off+8,ce,stcoOffsets)));
       else parts.push(b.slice(off,ce));
       off+=sz;}
     return parts;
   }
 
-  function walkTrak(b, s, e) {
+  function walkTrak(b, s, e, stcoOffsets) {
     const parts=[]; let off=s;
     while(off+8<=e){const sz=u32(b,off),nm=cc(b,off+4);if(sz<8)break;
       const ce=Math.min(off+sz,e);
       if(nm==='tkhd') parts.push(box('tkhd',patchDur(b.slice(off+8,ce), mvDur)));
-      else if(nm==='mdia') parts.push(box('mdia',...walkMdia(b,off+8,ce)));
+      else if(nm==='mdia') parts.push(box('mdia',...walkMdia(b,off+8,ce,stcoOffsets)));
       else if(nm==='edts') {} // skip
       else parts.push(b.slice(off,ce));
       off+=sz;}
@@ -1333,14 +1334,14 @@ async function extractClipBlob(file, clipIn, clipOut) {
 
   // First pass: build moov without stco to measure size
   function buildMoovContent(stcoOffsets) {
+    const placeholder = new Array(CC).fill(0);
+    const offsets = stcoOffsets || placeholder;
     const parts=[]; let off=8;
     while(off+8<=moovU8.length){const sz=u32(moovU8,off),nm=cc(moovU8,off+4);if(sz<8)break;
       const ce=Math.min(off+sz,moovU8.length);
       if(nm==='mvhd'){parts.push(box('mvhd',patchDur(moovU8.slice(off+8,ce),mvDur)));}
       else if(nm==='trak'&&isVideoTrak(moovU8,off+8,ce)){
-        const tp=walkTrak(moovU8,off+8,ce);
-        if(stcoOffsets) tp.push(mkStco(stcoOffsets));
-        else tp.push(mkStco(new Array(CC).fill(0)));
+        const tp=walkTrak(moovU8,off+8,ce,offsets);
         parts.push(box('trak',...tp));
       }
       // skip non-video traks, udta, meta
@@ -1870,7 +1871,8 @@ document.getElementById('loop-export').addEventListener('click', async e => {
 
   } catch(err) {
     exportOverlay.classList.remove('show');
-    showToast('剪輯失敗：' + (err.message || err));
+    const msg = err?.message || err?.toString() || JSON.stringify(err) || '未知錯誤';
+    showToast('剪輯失敗：' + msg);
     clearPendingClip();
   }
 });
